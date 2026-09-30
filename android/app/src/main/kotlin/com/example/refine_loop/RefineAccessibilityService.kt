@@ -1,12 +1,18 @@
 package com.example.refine_loop
 
 import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.GestureDescription
 import android.content.Intent
+import android.graphics.Path
+import android.graphics.Rect
 import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.view.accessibility.AccessibilityWindowInfo
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 class RefineAccessibilityService : AccessibilityService() {
 
@@ -16,11 +22,10 @@ class RefineAccessibilityService : AccessibilityService() {
         val isRunning: Boolean get() = instance != null
 
         const val RESPONSE_STABLE_MS = 6000L
-        const val POLL_INTERVAL_MS   = 1500L
-        const val MAX_WAIT_MS        = 180_000L
-        const val MAX_SAFETY_ROUNDS  = 25
+        const val POLL_INTERVAL_MS = 1500L
+        const val MAX_WAIT_MS = 180_000L
+        const val MAX_SAFETY_ROUNDS = 25
 
-        // كلمات يستخدمها التطبيق للتعرف على زر الإرسال في أي تطبيق
         private val SEND_KEYWORDS = listOf(
             "send", "إرسال", "ارسال", "أرسل", "ارسل", "submit", "发送"
         )
@@ -77,7 +82,6 @@ class RefineAccessibilityService : AccessibilityService() {
         var current = ""
         var round = 0
 
-        // ① المهمة للمنفّذ
         status = "إرسال المهمة للمنفّذ..."
         if (!openApp(executorPkg)) return abort("التطبيق غير موجود: $executorPkg")
         sleep(3000)
@@ -87,7 +91,6 @@ class RefineAccessibilityService : AccessibilityService() {
         while (running && round < cap) {
             round++
 
-            // ② المراجعة: أمرك المخصص + الأمر الأساسي + العمل
             status = "الدورة $round: إرسال للمراجع..."
             if (!openApp(reviewerPkg)) return abort("التطبيق غير موجود: $reviewerPkg")
             sleep(3000)
@@ -109,7 +112,6 @@ class RefineAccessibilityService : AccessibilityService() {
                 return
             }
 
-            // ③ التحسين
             status = "الدورة $round: التحسين بناءً على الملاحظات..."
             if (!openApp(executorPkg)) return abort("التطبيق غير موجود: $executorPkg")
             sleep(3000)
@@ -146,59 +148,149 @@ class RefineAccessibilityService : AccessibilityService() {
         }
     }
 
-    // يكتب النص ثم يضغط زر الإرسال — بدون أي معرّفات، اكتشاف تلقائي
+    // ─────────── كتابة + إرسال باكتشاف ذكي لزر الإرسال ───────────
+
     private fun typeAndSend(text: String): Boolean {
         return try {
-            val root = rootInActiveWindow ?: return false
+            var root = rootInActiveWindow ?: return false
             val input = findInputField(root) ?: return false
+            val inputBounds = boundsOf(input)
+
+            // لقطة للأزرار قبل الكتابة (لكشف الزر الذي يظهر بعدها)
+            val before = clickableSnapshot(root)
+
             input.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
             val args = Bundle().apply {
                 putCharSequence(
                     AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text
                 )
             }
-            if (!input.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args))
-                return false
-            sleep(800) // مهلة ليظهر زر الإرسال
+            if (!input.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) return false
+            sleep(1500)
 
-            val root2 = rootInActiveWindow ?: return false
-            val send = findSendButton(root2) ?: return false
-            send.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            root = rootInActiveWindow ?: return false
+            val candidates = buildSendCandidates(root, inputBounds, before)
+
+            // جرّب المرشحين بالترتيب حتى يفرغ حقل الإدخال (= نجح الإرسال)
+            for (candidate in candidates) {
+                val clicked = candidate.performAction(AccessibilityNodeInfo.ACTION_CLICK) ||
+                        tapNode(candidate)
+                if (!clicked) continue
+                sleep(1200)
+                val r = rootInActiveWindow ?: return true
+                val inp = findInputField(r) ?: return true
+                if (inp.text?.toString().isNullOrBlank()) return true
+            }
+            false
         } catch (e: Exception) {
             status = "خطأ في الكتابة/الإرسال: ${e.message}"
             false
         }
     }
 
-    // يبحث عن أي حقل إدخال (EditText) في الشاشة
+    private fun buildSendCandidates(
+        root: AccessibilityNodeInfo,
+        inputBounds: Rect,
+        before: List<Pair<Rect, Boolean>>,
+    ): List<AccessibilityNodeInfo> {
+        val clickables = mutableListOf<AccessibilityNodeInfo>()
+        collectClickables(root, clickables)
+        val usable = clickables.filter { !isInput(it) && isSmall(it) }
+
+        // 1) كلمة مفتاحية في النص أو الوصف أو اسم المورد
+        val byKeyword = usable.firstOrNull { node ->
+            val hay =
+                "${node.text} ${node.contentDescription} ${node.viewIdResourceName}".lowercase()
+            SEND_KEYWORDS.any { hay.contains(it.lowercase()) }
+        }
+
+        // 2) زر جديد ظهر بعد الكتابة، أو كان معطّلاً وتفعّل
+        val appeared = usable
+            .filter { node ->
+                val b = boundsOf(node)
+                val prev = before.firstOrNull { it.first == b }
+                prev == null || (!prev.second && node.isEnabled)
+            }
+            .sortedBy { distanceToInput(it, inputBounds) }
+
+        // 3) أي زر صغير ملاصق لحقل الإدخال
+        val nearby = usable
+            .filter { isNearInput(it, inputBounds) }
+            .sortedBy { distanceToInput(it, inputBounds) }
+
+        return (listOfNotNull(byKeyword) + appeared + nearby).distinct()
+    }
+
+    // ─────────── أدوات مساعدة ───────────
+
+    private fun boundsOf(node: AccessibilityNodeInfo): Rect =
+        Rect().also { node.getBoundsInScreen(it) }
+
+    private fun isInput(node: AccessibilityNodeInfo): Boolean =
+        node.className?.toString()?.contains("EditText") == true
+
+    private fun isSmall(node: AccessibilityNodeInfo): Boolean {
+        val b = boundsOf(node)
+        return b.width() in 1..450 && b.height() in 1..450
+    }
+
+    private fun isNearInput(node: AccessibilityNodeInfo, inputBounds: Rect): Boolean {
+        val b = boundsOf(node)
+        return b.top < inputBounds.bottom + 250 && b.bottom > inputBounds.top - 250
+    }
+
+    private fun distanceToInput(node: AccessibilityNodeInfo, inputBounds: Rect): Int {
+        val b = boundsOf(node)
+        val dx = maxOf(inputBounds.left - b.right, b.left - inputBounds.right, 0)
+        val dy = maxOf(inputBounds.top - b.bottom, b.top - inputBounds.bottom, 0)
+        return dx * dx + dy * dy
+    }
+
+    private fun clickableSnapshot(root: AccessibilityNodeInfo): List<Pair<Rect, Boolean>> {
+        val out = mutableListOf<AccessibilityNodeInfo>()
+        collectClickables(root, out)
+        return out.map { boundsOf(it) to it.isEnabled }
+    }
+
+    private fun collectClickables(node: AccessibilityNodeInfo, out: MutableList<AccessibilityNodeInfo>) {
+        // تجاهل نافذة لوحة المفاتيح بالكامل
+        if (node.window?.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD) return
+        if (node.isClickable) out.add(node)
+        for (i in 0 until node.childCount) {
+            node.getChild(i)?.let { collectClickables(it, out) }
+        }
+    }
+
+    // لمسة حقيقية على الشاشة إذا فشل الضغط العادي
+    private fun tapNode(node: AccessibilityNodeInfo): Boolean {
+        return try {
+            val b = boundsOf(node)
+            val path = Path().apply { moveTo(b.exactCenterX(), b.exactCenterY()) }
+            val gesture = GestureDescription.Builder()
+                .addStroke(GestureDescription.StrokeDescription(path, 0, 100))
+                .build()
+            val latch = CountDownLatch(1)
+            var ok = false
+            dispatchGesture(gesture, object : GestureResultCallback() {
+                override fun onCompleted(g: GestureDescription?) { ok = true; latch.countDown() }
+                override fun onCancelled(g: GestureDescription?) { latch.countDown() }
+            }, null)
+            latch.await(2, TimeUnit.SECONDS)
+            ok
+        } catch (_: Exception) { false }
+    }
+
     private fun findInputField(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
         val queue = ArrayDeque<AccessibilityNodeInfo>()
         queue.add(root)
         while (queue.isNotEmpty()) {
             val node = queue.removeFirst()
-            if (node.className?.toString()?.contains("EditText") == true) return node
+            if (isInput(node)) return node
             for (i in 0 until node.childCount) {
                 node.getChild(i)?.let { queue.add(it) }
             }
         }
         return null
-    }
-
-    // يبحث عن زر الإرسال بالكلمات المفتاحية
-    private fun findSendButton(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-        val clickables = mutableListOf<AccessibilityNodeInfo>()
-        collectClickables(root, clickables)
-        return clickables.firstOrNull { node ->
-            val text = "${node.text} ${node.contentDescription}".lowercase()
-            SEND_KEYWORDS.any { text.contains(it.lowercase()) }
-        }
-    }
-
-    private fun collectClickables(node: AccessibilityNodeInfo, out: MutableList<AccessibilityNodeInfo>) {
-        if (node.isClickable) out.add(node)
-        for (i in 0 until node.childCount) {
-            node.getChild(i)?.let { collectClickables(it, out) }
-        }
     }
 
     private fun waitForResponse(): String? {
@@ -223,7 +315,6 @@ class RefineAccessibilityService : AccessibilityService() {
             val root = rootInActiveWindow ?: return null
             val texts = mutableListOf<String>()
             collectTexts(root, texts)
-            // نفضّل آخر نص طويل (هو غالباً رد النموذج وليس أزرار الواجهة)
             texts.lastOrNull { it.length > 40 } ?: texts.lastOrNull()
         } catch (_: Exception) { null }
     }
