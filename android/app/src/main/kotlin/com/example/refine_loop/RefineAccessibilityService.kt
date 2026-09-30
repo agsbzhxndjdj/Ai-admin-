@@ -5,7 +5,6 @@ import android.content.Intent
 import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
-import android.os.Looper
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 
@@ -16,17 +15,15 @@ class RefineAccessibilityService : AccessibilityService() {
             private set
         val isRunning: Boolean get() = instance != null
 
-        // ════════════ TODO: عبّئ هذه لكل تطبيق تستهدفه ════════════
-        const val EXECUTOR_PACKAGE = "TODO_PACKAGE_QWEN"
-        const val REVIEWER_PACKAGE = "TODO_PACKAGE_GEMINI"
-        const val INPUT_FIELD_ID   = "TODO_INPUT_FIELD_ID"
-        const val SEND_BUTTON_ID   = "TODO_SEND_BUTTON_ID"
-        // ═══════════════════════════════════════════════════════════
-
         const val RESPONSE_STABLE_MS = 6000L
         const val POLL_INTERVAL_MS   = 1500L
         const val MAX_WAIT_MS        = 180_000L
         const val MAX_SAFETY_ROUNDS  = 25
+
+        // كلمات يستخدمها التطبيق للتعرف على زر الإرسال في أي تطبيق
+        private val SEND_KEYWORDS = listOf(
+            "send", "إرسال", "ارسال", "أرسل", "ارسل", "submit", "发送"
+        )
     }
 
     private val worker = HandlerThread("LoopWorker").apply { start() }
@@ -52,10 +49,16 @@ class RefineAccessibilityService : AccessibilityService() {
 
     fun getStatus() = status
 
-    fun startLoop(task: String, reviewPrompt: String, rounds: Int) {
+    fun startLoop(
+        task: String,
+        reviewPrompt: String,
+        rounds: Int,
+        executorPkg: String,
+        reviewerPkg: String,
+    ) {
         if (running) return
         running = true
-        bg.post { runLoop(task, reviewPrompt, rounds) }
+        bg.post { runLoop(task, reviewPrompt, rounds, executorPkg, reviewerPkg) }
     }
 
     fun stopLoop() {
@@ -63,22 +66,41 @@ class RefineAccessibilityService : AccessibilityService() {
         status = "تم الإيقاف يدوياً"
     }
 
-    private fun runLoop(task: String, reviewPrompt: String, rounds: Int) {
+    private fun runLoop(
+        task: String,
+        reviewPrompt: String,
+        rounds: Int,
+        executorPkg: String,
+        reviewerPkg: String,
+    ) {
         val cap = if (rounds <= 0) MAX_SAFETY_ROUNDS else rounds
-        var current = task
+        var current = ""
         var round = 0
 
+        // ① المهمة للمنفّذ
         status = "إرسال المهمة للمنفّذ..."
-        openApp(EXECUTOR_PACKAGE); sleep(2500)
-        typeText(current); pressSend()
+        if (!openApp(executorPkg)) return abort("التطبيق غير موجود: $executorPkg")
+        sleep(3000)
+        if (!typeAndSend(task)) return abort("تعذّرت الكتابة أو الإرسال في المنفّذ")
         current = waitForResponse() ?: return abort("لا يوجد رد من المنفّذ")
 
         while (running && round < cap) {
             round++
 
+            // ② المراجعة: أمرك المخصص + الأمر الأساسي + العمل
             status = "الدورة $round: إرسال للمراجع..."
-            openApp(REVIEWER_PACKAGE); sleep(2500)
-            typeText("$reviewPrompt\n\n$current"); pressSend()
+            if (!openApp(reviewerPkg)) return abort("التطبيق غير موجود: $reviewerPkg")
+            sleep(3000)
+            val reviewMessage = buildString {
+                append(reviewPrompt)
+                append("\n\nلقد كان الأمر الأساسي: ")
+                append(task)
+                append("\n\nالعمل الناتج:\n")
+                append(current)
+                append("\n\nإذا كان العمل مكتملاً وممتازاً فارد بكلمة واحدة فقط: معتمد")
+            }
+            if (!typeAndSend(reviewMessage))
+                return abort("تعذّرت الكتابة أو الإرسال في المراجع")
             val feedback = waitForResponse() ?: return abort("لا يوجد رد من المراجع")
 
             if (feedback.take(80).contains("معتمد")) {
@@ -87,10 +109,12 @@ class RefineAccessibilityService : AccessibilityService() {
                 return
             }
 
+            // ③ التحسين
             status = "الدورة $round: التحسين بناءً على الملاحظات..."
-            openApp(EXECUTOR_PACKAGE); sleep(2500)
-            typeText("ملاحظات المراجع:\n$feedback\n\nحسّن هذا العمل:\n$current")
-            pressSend()
+            if (!openApp(executorPkg)) return abort("التطبيق غير موجود: $executorPkg")
+            sleep(3000)
+            if (!typeAndSend("ملاحظات المراجع:\n$feedback\n\nحسّن هذا العمل:\n$current"))
+                return abort("تعذّرت الكتابة أو الإرسال في المنفّذ")
             current = waitForResponse() ?: return abort("لا يوجد رد تحسين")
         }
 
@@ -108,44 +132,73 @@ class RefineAccessibilityService : AccessibilityService() {
         try { Thread.sleep(ms) } catch (_: InterruptedException) {}
     }
 
-    private fun openApp(pkg: String) {
-        try {
+    private fun openApp(pkg: String): Boolean {
+        return try {
             val intent = packageManager.getLaunchIntentForPackage(pkg)
             if (intent != null) {
                 intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 startActivity(intent)
-            } else {
-                status = "التطبيق غير موجود: $pkg"
-            }
+                true
+            } else false
         } catch (e: Exception) {
             status = "خطأ في فتح التطبيق: ${e.message}"
+            false
         }
     }
 
-    private fun typeText(text: String) {
-        try {
-            val root = rootInActiveWindow ?: return
-            val input = root.findAccessibilityNodeInfosByViewId(INPUT_FIELD_ID)
-                .firstOrNull() ?: return
+    // يكتب النص ثم يضغط زر الإرسال — بدون أي معرّفات، اكتشاف تلقائي
+    private fun typeAndSend(text: String): Boolean {
+        return try {
+            val root = rootInActiveWindow ?: return false
+            val input = findInputField(root) ?: return false
             input.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
             val args = Bundle().apply {
                 putCharSequence(
                     AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text
                 )
             }
-            input.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+            if (!input.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args))
+                return false
+            sleep(800) // مهلة ليظهر زر الإرسال
+
+            val root2 = rootInActiveWindow ?: return false
+            val send = findSendButton(root2) ?: return false
+            send.performAction(AccessibilityNodeInfo.ACTION_CLICK)
         } catch (e: Exception) {
-            status = "خطأ في الكتابة: ${e.message}"
+            status = "خطأ في الكتابة/الإرسال: ${e.message}"
+            false
         }
     }
 
-    private fun pressSend() {
-        try {
-            val root = rootInActiveWindow ?: return
-            root.findAccessibilityNodeInfosByViewId(SEND_BUTTON_ID)
-                .firstOrNull()
-                ?.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-        } catch (_: Exception) {}
+    // يبحث عن أي حقل إدخال (EditText) في الشاشة
+    private fun findInputField(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        while (queue.isNotEmpty()) {
+            val node = queue.removeFirst()
+            if (node.className?.toString()?.contains("EditText") == true) return node
+            for (i in 0 until node.childCount) {
+                node.getChild(i)?.let { queue.add(it) }
+            }
+        }
+        return null
+    }
+
+    // يبحث عن زر الإرسال بالكلمات المفتاحية
+    private fun findSendButton(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        val clickables = mutableListOf<AccessibilityNodeInfo>()
+        collectClickables(root, clickables)
+        return clickables.firstOrNull { node ->
+            val text = "${node.text} ${node.contentDescription}".lowercase()
+            SEND_KEYWORDS.any { text.contains(it.lowercase()) }
+        }
+    }
+
+    private fun collectClickables(node: AccessibilityNodeInfo, out: MutableList<AccessibilityNodeInfo>) {
+        if (node.isClickable) out.add(node)
+        for (i in 0 until node.childCount) {
+            node.getChild(i)?.let { collectClickables(it, out) }
+        }
     }
 
     private fun waitForResponse(): String? {
@@ -170,7 +223,8 @@ class RefineAccessibilityService : AccessibilityService() {
             val root = rootInActiveWindow ?: return null
             val texts = mutableListOf<String>()
             collectTexts(root, texts)
-            texts.lastOrNull()
+            // نفضّل آخر نص طويل (هو غالباً رد النموذج وليس أزرار الواجهة)
+            texts.lastOrNull { it.length > 40 } ?: texts.lastOrNull()
         } catch (_: Exception) { null }
     }
 
