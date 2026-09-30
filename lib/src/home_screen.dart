@@ -12,7 +12,8 @@ class _HomeScreenState extends State<HomeScreen> {
   final _bridge = AccessibilityBridge();
   final _taskCtrl = TextEditingController(text: 'أنشئ لي تطبيق مراسلة');
   final _promptCtrl = TextEditingController(
-      text: 'اعطني رأيك بهذا واعطني العيوب والمشاكل والحلول والأشياء التي تحتاج تطوير');
+      text:
+          'اعطني رأيك بهذا واعطني العيوب والمشاكل والحلول والأشياء التي تحتاج تطوير');
   final _roundsCtrl = TextEditingController(text: '3');
 
   bool _serviceOn = false;
@@ -20,11 +21,17 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _running = false;
   Timer? _pollTimer;
 
+  List<AppInfo> _apps = [];
+  AppInfo? _executor;
+  AppInfo? _reviewer;
+
   @override
   void initState() {
     super.initState();
     _refreshServiceState();
-    _pollTimer = Timer.periodic(const Duration(seconds: 2), (_) => _refreshStatus());
+    _loadApps();
+    _pollTimer =
+        Timer.periodic(const Duration(seconds: 2), (_) => _refreshStatus());
   }
 
   @override
@@ -38,10 +45,65 @@ class _HomeScreenState extends State<HomeScreen> {
     if (mounted) setState(() => _serviceOn = on);
   }
 
+  Future<void> _loadApps() async {
+    final apps = await _bridge.listInstalledApps();
+    if (!mounted) return;
+    setState(() {
+      _apps = apps;
+      // محاولة اختيار ذكية تلقائياً
+      _executor ??= _guess(['qwen', 'tongyi', 'chatgpt', 'claude']);
+      _reviewer ??= _guess(['gemini', 'bard']);
+    });
+  }
+
+  AppInfo? _guess(List<String> keys) {
+    for (final k in keys) {
+      for (final a in _apps) {
+        if (a.packageName.toLowerCase().contains(k) ||
+            a.label.toLowerCase().contains(k)) return a;
+      }
+    }
+    return null;
+  }
+
   Future<void> _refreshStatus() async {
     if (!_running) return;
     final s = await _bridge.getStatus();
-    if (mounted) setState(() => _status = s);
+    if (!mounted) return;
+    final finished =
+        s.startsWith('🏁') || s.startsWith('✅') || s.startsWith('⛔');
+    setState(() {
+      _status = s;
+      if (finished) _running = false;
+    });
+  }
+
+  Future<void> _start() async {
+    if (_executor == null || _reviewer == null) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('اختر تطبيق المنفّذ وتطبيق المراجع أولاً')));
+      return;
+    }
+    final rounds = int.tryParse(_roundsCtrl.text) ?? 3;
+    setState(() {
+      _running = true;
+      _status = 'جارٍ البدء...';
+    });
+    await _bridge.startLoop(
+      task: _taskCtrl.text,
+      reviewPrompt: _promptCtrl.text,
+      rounds: rounds,
+      executorPackage: _executor!.packageName,
+      reviewerPackage: _reviewer!.packageName,
+    );
+  }
+
+  Future<void> _stop() async {
+    await _bridge.stopLoop();
+    setState(() {
+      _running = false;
+      _status = 'تم الإيقاف';
+    });
   }
 
   @override
@@ -51,13 +113,13 @@ class _HomeScreenState extends State<HomeScreen> {
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
-          // حالة الخدمة
           Card(
             color: _serviceOn ? Colors.green.shade50 : Colors.orange.shade50,
             child: ListTile(
               leading: Icon(_serviceOn ? Icons.check_circle : Icons.warning,
                   color: _serviceOn ? Colors.green : Colors.orange),
-              title: Text(_serviceOn ? 'خدمة الوصول مفعّلة' : 'خدمة الوصول غير مفعّلة'),
+              title: Text(
+                  _serviceOn ? 'خدمة الوصول مفعّلة' : 'خدمة الوصول غير مفعّلة'),
               trailing: TextButton(
                 onPressed: () async {
                   await _bridge.openAccessibilitySettings();
@@ -69,6 +131,39 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
           ),
           const SizedBox(height: 12),
+
+          // ★ اختيار التطبيقات من داخل التطبيق ★
+          DropdownButtonFormField<AppInfo>(
+            value: _executor,
+            isExpanded: true,
+            decoration: const InputDecoration(
+                labelText: 'تطبيق المنفّذ', border: OutlineInputBorder()),
+            items: [
+              for (final app in _apps)
+                DropdownMenuItem(
+                    value: app,
+                    child: Text(app.label,
+                        overflow: TextOverflow.ellipsis)),
+            ],
+            onChanged: (v) => setState(() => _executor = v),
+          ),
+          const SizedBox(height: 12),
+          DropdownButtonFormField<AppInfo>(
+            value: _reviewer,
+            isExpanded: true,
+            decoration: const InputDecoration(
+                labelText: 'تطبيق المراجع', border: OutlineInputBorder()),
+            items: [
+              for (final app in _apps)
+                DropdownMenuItem(
+                    value: app,
+                    child: Text(app.label,
+                        overflow: TextOverflow.ellipsis)),
+            ],
+            onChanged: (v) => setState(() => _reviewer = v),
+          ),
+          const SizedBox(height: 12),
+
           TextField(
             controller: _taskCtrl,
             maxLines: 3,
@@ -80,7 +175,8 @@ class _HomeScreenState extends State<HomeScreen> {
             controller: _promptCtrl,
             maxLines: 3,
             decoration: const InputDecoration(
-                labelText: 'أمر المراجعة المخصص', border: OutlineInputBorder()),
+                labelText: 'أمر المراجعة المخصص',
+                border: OutlineInputBorder()),
           ),
           const SizedBox(height: 12),
           TextField(
@@ -132,26 +228,5 @@ class _HomeScreenState extends State<HomeScreen> {
         ],
       ),
     );
-  }
-
-  Future<void> _start() async {
-    final rounds = int.tryParse(_roundsCtrl.text) ?? 3;
-    setState(() {
-      _running = true;
-      _status = 'جارٍ البدء...';
-    });
-    await _bridge.startLoop(
-      task: _taskCtrl.text,
-      reviewPrompt: _promptCtrl.text,
-      rounds: rounds,
-    );
-  }
-
-  Future<void> _stop() async {
-    await _bridge.stopLoop();
-    setState(() {
-      _running = false;
-      _status = 'تم الإيقاف';
-    });
   }
 }
