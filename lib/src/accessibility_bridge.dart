@@ -45,6 +45,14 @@ class AccessibilityBridge {
     }
   }
 
+  Future<void> startCalibration(String packageName) =>
+      _channel.invokeMethod('startCalibration', {'package': packageName});
+
+  Future<bool> isCalibrated(String packageName) async =>
+      await _channel.invokeMethod<bool>(
+          'isCalibrated', {'package': packageName}) ??
+      false;
+
   Future<void> startLoop({
     required String task,
     required String reviewPrompt,
