@@ -37,6 +37,20 @@ class MainActivity : FlutterActivity() {
                         result.success(list)
                     }
 
+                    "startCalibration" -> {
+                        val pkg = call.argument<String>("package") ?: ""
+                        RefineAccessibilityService.instance?.startCalibration(pkg)
+                        result.success(true)
+                    }
+
+                    "isCalibrated" -> {
+                        val pkg = call.argument<String>("package") ?: ""
+                        result.success(
+                            RefineAccessibilityService.instance?.isCalibrated(pkg)
+                                ?: false
+                        )
+                    }
+
                     "startLoop" -> {
                         val task = call.argument<String>("task") ?: ""
                         val prompt = call.argument<String>("reviewPrompt") ?: ""
