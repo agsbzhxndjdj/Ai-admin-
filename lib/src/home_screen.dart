@@ -24,14 +24,18 @@ class _HomeScreenState extends State<HomeScreen> {
   List<AppInfo> _apps = [];
   AppInfo? _executor;
   AppInfo? _reviewer;
+  bool _calExecutor = false;
+  bool _calReviewer = false;
 
   @override
   void initState() {
     super.initState();
     _refreshServiceState();
     _loadApps();
-    _pollTimer =
-        Timer.periodic(const Duration(seconds: 2), (_) => _refreshStatus());
+    _pollTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+      _refreshStatus();
+      _refreshBadges();
+    });
   }
 
   @override
@@ -50,10 +54,10 @@ class _HomeScreenState extends State<HomeScreen> {
     if (!mounted) return;
     setState(() {
       _apps = apps;
-      // محاولة اختيار ذكية تلقائياً
       _executor ??= _guess(['qwen', 'tongyi', 'chatgpt', 'claude']);
       _reviewer ??= _guess(['gemini', 'bard']);
     });
+    _refreshBadges();
   }
 
   AppInfo? _guess(List<String> keys) {
@@ -66,6 +70,13 @@ class _HomeScreenState extends State<HomeScreen> {
     return null;
   }
 
+  Future<void> _refreshBadges() async {
+    if (_executor == null || _reviewer == null) return;
+    final e = await _bridge.isCalibrated(_executor!.packageName);
+    final r = await _bridge.isCalibrated(_reviewer!.packageName);
+    if (mounted) setState(() => {_calExecutor = e, _calReviewer = r});
+  }
+
   Future<void> _refreshStatus() async {
     if (!_running) return;
     final s = await _bridge.getStatus();
@@ -76,6 +87,34 @@ class _HomeScreenState extends State<HomeScreen> {
       _status = s;
       if (finished) _running = false;
     });
+  }
+
+  Future<void> _calibrate(AppInfo app, bool isExecutor) async {
+    if (!_serviceOn) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('فعّل خدمة الوصول أولاً')));
+      return;
+    }
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: Text('معايرة زر الإرسال في ${app.label}'),
+        content: const Text(
+            '1) سيُفتح التطبيق الآن\n'
+            '2) اكتب أي نص في حقل الكتابة (مثلاً: تجربة)\n'
+            '3) اضغط زر الإرسال الحقيقي الذي تضغطه عادة\n\n'
+            'سيُحفظ موضع الزر تلقائياً (ستُرسل رسالة تجريبية واحدة وهذا طبيعي).'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('إلغاء')),
+          FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('ابدأ المعايرة')),
+        ],
+      ),
+    );
+    if (confirm == true) await _bridge.startCalibration(app.packageName);
   }
 
   Future<void> _start() async {
@@ -132,7 +171,6 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
           const SizedBox(height: 12),
 
-          // ★ اختيار التطبيقات من داخل التطبيق ★
           DropdownButtonFormField<AppInfo>(
             value: _executor,
             isExpanded: true,
@@ -140,14 +178,22 @@ class _HomeScreenState extends State<HomeScreen> {
                 labelText: 'تطبيق المنفّذ', border: OutlineInputBorder()),
             items: [
               for (final app in _apps)
-                DropdownMenuItem(
-                    value: app,
-                    child: Text(app.label,
-                        overflow: TextOverflow.ellipsis)),
+                DropdownMenuItem(value: app,
+                    child: Text(app.label, overflow: TextOverflow.ellipsis)),
             ],
             onChanged: (v) => setState(() => _executor = v),
           ),
+          const SizedBox(height: 8),
+          OutlinedButton.icon(
+            onPressed: _executor == null ? null : () => _calibrate(_executor!, true),
+            icon: Icon(_calExecutor ? Icons.check_circle : Icons.touch_app,
+                size: 18, color: _calExecutor ? Colors.green : null),
+            label: Text(_calExecutor
+                ? 'معايرة المنفّذ محفوظة ✓'
+                : 'معايرة زر إرسال المنفّذ'),
+          ),
           const SizedBox(height: 12),
+
           DropdownButtonFormField<AppInfo>(
             value: _reviewer,
             isExpanded: true,
@@ -155,12 +201,19 @@ class _HomeScreenState extends State<HomeScreen> {
                 labelText: 'تطبيق المراجع', border: OutlineInputBorder()),
             items: [
               for (final app in _apps)
-                DropdownMenuItem(
-                    value: app,
-                    child: Text(app.label,
-                        overflow: TextOverflow.ellipsis)),
+                DropdownMenuItem(value: app,
+                    child: Text(app.label, overflow: TextOverflow.ellipsis)),
             ],
             onChanged: (v) => setState(() => _reviewer = v),
+          ),
+          const SizedBox(height: 8),
+          OutlinedButton.icon(
+            onPressed: _reviewer == null ? null : () => _calibrate(_reviewer!, false),
+            icon: Icon(_calReviewer ? Icons.check_circle : Icons.touch_app,
+                size: 18, color: _calReviewer ? Colors.green : null),
+            label: Text(_calReviewer
+                ? 'معايرة المراجع محفوظة ✓'
+                : 'معايرة زر إرسال المراجع'),
           ),
           const SizedBox(height: 12),
 
@@ -175,8 +228,7 @@ class _HomeScreenState extends State<HomeScreen> {
             controller: _promptCtrl,
             maxLines: 3,
             decoration: const InputDecoration(
-                labelText: 'أمر المراجعة المخصص',
-                border: OutlineInputBorder()),
+                labelText: 'أمر المراجعة المخصص', border: OutlineInputBorder()),
           ),
           const SizedBox(height: 12),
           TextField(
