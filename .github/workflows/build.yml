@@ -3,7 +3,7 @@ name: Build APK
 on:
   push:
     branches: [ main ]
-  workflow_dispatch:   # يسمح لك بتشغيله يدوياً بضغطة زر
+  workflow_dispatch:
 
 jobs:
   build:
@@ -22,6 +22,11 @@ jobs:
         uses: subosito/flutter-action@v2
         with:
           channel: 'stable'
+
+      # ✨ الخطوة السحرية: توليد كل ملفات فلتر القياسية الناقصة تلقائياً
+      # بدون أن تمس ملفاتك الموجودة
+      - name: Scaffold missing files
+        run: flutter create --platforms=android --org com.example --project-name refine_loop .
 
       - name: Get dependencies
         run: flutter pub get
