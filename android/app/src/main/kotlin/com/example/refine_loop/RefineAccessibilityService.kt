@@ -101,12 +101,17 @@ class RefineAccessibilityService : AccessibilityService() {
     }
 
     private fun getCalibration(pkg: String): Calibration? {
-        val s = prefs.getString("cal_$pkg", null) ?: return null
-        val p = s.split("|", 4)
-        return try {
-            Calibration(p[0].toInt(), p[1].toInt(),
-                p.getOrNull(2)?.takeIf { it.isNotBlank() }, p.getOrNull(3))
-        } catch (_: Exception) { null }
+    val s = prefs.getString("cal_$pkg", null) ?: return null
+    val parts = s.split("\\|".toRegex(), limit = 4)
+    if (parts.size < 2) return null
+    return try {
+        Calibration(
+            parts[0].toInt(),
+            parts[1].toInt(),
+            parts.getOrNull(2)?.takeIf { it.isNotBlank() },
+            parts.getOrNull(3)
+        )
+    } catch (_: Exception) { null }
     }
 
     fun startLoop(
