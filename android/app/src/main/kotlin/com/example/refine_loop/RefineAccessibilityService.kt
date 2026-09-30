@@ -11,15 +11,13 @@ import android.os.HandlerThread
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
+import android.widget.Toast
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 private data class Snap(val bounds: Rect, val enabled: Boolean, val desc: String)
-private data class Cand(
-    val node: AccessibilityNodeInfo,
-    val bounds: Rect,
-    val desc: String,
-)
+private data class Cand(val node: AccessibilityNodeInfo, val bounds: Rect, val desc: String)
+private data class Calibration(val x: Int, val y: Int, val viewId: String?, val desc: String?)
 
 class RefineAccessibilityService : AccessibilityService() {
 
@@ -28,7 +26,6 @@ class RefineAccessibilityService : AccessibilityService() {
             private set
         val isRunning: Boolean get() = instance != null
 
-        // مهلة 15 دقيقة لكل رد (تغطي تفكيراً طويلاً جداً)
         const val RESPONSE_STABLE_MS = 8000L
         const val POLL_INTERVAL_MS = 1500L
         const val MAX_WAIT_MS = 900_000L
@@ -37,8 +34,6 @@ class RefineAccessibilityService : AccessibilityService() {
         private val SEND_KEYWORDS = listOf(
             "send", "إرسال", "ارسال", "أرسل", "ارسل", "submit", "发送"
         )
-
-        // أزرار يُمنع ضغطها نهائياً
         private val EXCLUDE_KEYWORDS = listOf(
             "mic", "microphone", "voice", "audio", "record", "dictate",
             "camera", "photo", "image", "attach", "file",
@@ -49,9 +44,11 @@ class RefineAccessibilityService : AccessibilityService() {
 
     private val worker = HandlerThread("LoopWorker").apply { start() }
     private val bg = Handler(worker.looper)
+    private val prefs by lazy { getSharedPreferences("refine_loop", MODE_PRIVATE) }
 
     @Volatile private var running = false
     @Volatile private var status = "الخدمة متصلة وجاهزة"
+    @Volatile private var calibrationTarget: String? = null
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -59,7 +56,21 @@ class RefineAccessibilityService : AccessibilityService() {
         status = "الخدمة متصلة"
     }
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+    // ─────────── التقاط المعايرة ───────────
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        val target = calibrationTarget ?: return
+        if (event == null) return
+        if (event.eventType != AccessibilityEvent.TYPE_VIEW_CLICKED &&
+            event.eventType != AccessibilityEvent.TYPE_VIEW_LONG_CLICKED) return
+        val node = event.source ?: return
+        if (node.window?.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD) return
+        if (isInput(node)) return
+        val b = boundsOf(node)
+        if (b.width() <= 0 || b.height() <= 0) return
+        saveCalibration(target, b, node.viewIdResourceName,
+            "${node.text} ${node.contentDescription}")
+    }
+
     override fun onInterrupt() {}
 
     override fun onDestroy() {
@@ -69,6 +80,34 @@ class RefineAccessibilityService : AccessibilityService() {
     }
 
     fun getStatus() = status
+
+    // ─────────── المعايرة ───────────
+
+    fun isCalibrated(pkg: String) = prefs.contains("cal_$pkg")
+
+    fun startCalibration(pkg: String) {
+        calibrationTarget = pkg
+        openApp(pkg)
+        Toast.makeText(this,
+            "اكتب أي نص ثم اضغط زر الإرسال لحفظ موضعه", Toast.LENGTH_LONG).show()
+    }
+
+    private fun saveCalibration(pkg: String, b: Rect, viewId: String?, desc: String?) {
+        val cx = b.exactCenterX().toInt()
+        val cy = b.exactCenterY().toInt()
+        prefs.edit().putString("cal_$pkg", "$cx|$cy|${viewId ?: ""}|${desc ?: ""}").apply()
+        calibrationTarget = null
+        Toast.makeText(this, "✅ تم حفظ معايرة الزر لهذا التطبيق", Toast.LENGTH_LONG).show()
+    }
+
+    private fun getCalibration(pkg: String): Calibration? {
+        val s = prefs.getString("cal_$pkg", null) ?: return null
+        val p = s.split("|", 4)
+        return try {
+            Calibration(p[0].toInt(), p[1].toInt(),
+                p.getOrNull(2)?.takeIf { it.isNotBlank() }, p.getOrNull(3))
+        } catch (_: Exception) { null }
+    }
 
     fun startLoop(
         task: String,
@@ -101,7 +140,7 @@ class RefineAccessibilityService : AccessibilityService() {
         status = "إرسال المهمة للمنفّذ..."
         if (!openApp(executorPkg)) return abort("التطبيق غير موجود: $executorPkg")
         sleep(3000)
-        if (!typeAndSend(task)) return abort("تعذّرت الكتابة أو الإرسال في المنفّذ")
+        if (!typeAndSend(task, executorPkg)) return abort("تعذّرت الكتابة أو الإرسال في المنفّذ")
         status = "بانتظار رد المنفّذ (قد يطول بسبب التفكير)..."
         current = waitForResponse(task) ?: return abort("انتهت مهلة انتظار رد المنفّذ")
 
@@ -119,7 +158,7 @@ class RefineAccessibilityService : AccessibilityService() {
                 append(current)
                 append("\n\nإذا كان العمل مكتملاً وممتازاً فارد بكلمة واحدة فقط: معتمد")
             }
-            if (!typeAndSend(reviewMessage))
+            if (!typeAndSend(reviewMessage, reviewerPkg))
                 return abort("تعذّرت الكتابة أو الإرسال في المراجع")
             status = "الدورة $round: بانتظار رد المراجع..."
             val feedback = waitForResponse(reviewMessage)
@@ -135,7 +174,7 @@ class RefineAccessibilityService : AccessibilityService() {
             if (!openApp(executorPkg)) return abort("التطبيق غير موجود: $executorPkg")
             sleep(3000)
             val improveMessage = "ملاحظات المراجع:\n$feedback\n\nحسّن هذا العمل:\n$current"
-            if (!typeAndSend(improveMessage))
+            if (!typeAndSend(improveMessage, executorPkg))
                 return abort("تعذّرت الكتابة أو الإرسال في المنفّذ")
             status = "الدورة $round: بانتظار الرد المحسّن..."
             current = waitForResponse(improveMessage)
@@ -170,15 +209,13 @@ class RefineAccessibilityService : AccessibilityService() {
         }
     }
 
-    // ─────────── كتابة + إرسال ذكي ───────────
+    // ─────────── كتابة + إرسال (معايرة أولاً ثم تلقائي) ───────────
 
-    private fun typeAndSend(text: String): Boolean {
+    private fun typeAndSend(text: String, pkg: String): Boolean {
         return try {
             var root = rootInActiveWindow ?: return false
             val input = findInputField(root) ?: return false
             val inputBounds = boundsOf(input)
-
-            // لقطة الأزرار والحقل فارغ
             val before = snapshot(root)
 
             input.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
@@ -191,32 +228,51 @@ class RefineAccessibilityService : AccessibilityService() {
             sleep(1500)
 
             root = rootInActiveWindow ?: return false
-            val candidates = buildSendCandidates(root, inputBounds, before)
 
+            // 0) المعايرة المحفوظة — الأولوية القصوى
+            getCalibration(pkg)?.let { cal ->
+                if (tryCalibrated(root, cal)) {
+                    sleep(1500)
+                    val inp = findInputField(rootInActiveWindow ?: return true)
+                    if (inp != null && inp.text?.toString().isNullOrBlank()) return true
+                    if (inp == null) {
+                        performGlobalAction(GLOBAL_ACTION_BACK); sleep(800)
+                    }
+                }
+            }
+
+            // ثم الاستراتيجيات التلقائية
+            val candidates = buildSendCandidates(root, inputBounds, before)
             for (c in candidates) {
                 val clicked = c.performAction(AccessibilityNodeInfo.ACTION_CLICK) ||
                         tapAt(boundsOf(c))
                 if (!clicked) continue
                 sleep(1500)
-
                 val r = rootInActiveWindow
                 val inp = r?.let { findInputField(it) }
-
-                // نجح الإرسال: الحقل موجود وفرغ من النص
                 if (inp != null && inp.text?.toString().isNullOrBlank()) return true
-
-                // فُتحت شاشة غريبة (مثل تسجيل الصوت): اضغط رجوع وجرّب التالي
                 if (inp == null) {
-                    performGlobalAction(GLOBAL_ACTION_BACK)
-                    sleep(800)
+                    performGlobalAction(GLOBAL_ACTION_BACK); sleep(800)
                 }
-                // الحقل ما زال فيه النص: الضغط لم يفد، جرّب التالي بدون رجوع
             }
             false
         } catch (e: Exception) {
             status = "خطأ في الكتابة/الإرسال: ${e.message}"
             false
         }
+    }
+
+    private fun tryCalibrated(root: AccessibilityNodeInfo, cal: Calibration): Boolean {
+        cal.viewId?.let { id ->
+            val node = try {
+                root.findAccessibilityNodeInfosByViewId(id).firstOrNull()
+            } catch (_: Exception) { null }
+            if (node != null) {
+                return node.performAction(AccessibilityNodeInfo.ACTION_CLICK) ||
+                        tapAt(boundsOf(node))
+            }
+        }
+        return tapAt(Rect(cal.x - 20, cal.y - 20, cal.x + 20, cal.y + 20))
     }
 
     private fun buildSendCandidates(
@@ -229,16 +285,12 @@ class RefineAccessibilityService : AccessibilityService() {
 
         val now = clickables
             .map { n -> Cand(n, boundsOf(n), "${n.text} ${n.contentDescription}") }
-            .filter {
-                !isInput(it.node) && isSmall(it.bounds) && !isExcluded(it.desc)
-            }
+            .filter { !isInput(it.node) && isSmall(it.bounds) && !isExcluded(it.desc) }
 
-        // 1) كلمة مفتاحية للإرسال
         val c1 = now.firstOrNull { c ->
             SEND_KEYWORDS.any { c.desc.lowercase().contains(it.lowercase()) }
         }?.node
 
-        // 2) زر جديد ظهر بعد الكتابة / تفعّل / تغيّر وصفه = الأرجح للإرسال
         val c2 = now
             .filter { c ->
                 val prev = before.firstOrNull { it.bounds == c.bounds }
@@ -247,13 +299,11 @@ class RefineAccessibilityService : AccessibilityService() {
             .sortedBy { distance(it.bounds, inputBounds) }
             .map { it.node }
 
-        // 3) نفس موضع زر قديم (لو استُبدل المايك بالإرسال في نفس المكان)
         val c3 = now
             .filter { c -> before.any { it.bounds == c.bounds } }
             .sortedBy { distance(it.bounds, inputBounds) }
             .map { it.node }
 
-        // 4) أي زر صغير ملاصق للحقل (ملاذ أخير)
         val c4 = now
             .filter { isNearInput(it.bounds, inputBounds) }
             .sortedBy { distance(it.bounds, inputBounds) }
@@ -262,7 +312,7 @@ class RefineAccessibilityService : AccessibilityService() {
         return (listOfNotNull(c1) + c2 + c3 + c4).distinct()
     }
 
-    // ─────────── انتظار الرد مع تجاهل رسالتك أنت ───────────
+    // ─────────── انتظار الرد ───────────
 
     private fun waitForResponse(sentText: String): String? {
         val sentNorm = norm(sentText)
@@ -287,7 +337,6 @@ class RefineAccessibilityService : AccessibilityService() {
             val root = rootInActiveWindow ?: return null
             val texts = mutableListOf<String>()
             collectTexts(root, texts)
-            // استبعد نص رسالتك المرسلة نفسها
             val ai = texts.filter { t ->
                 val n = norm(t)
                 n != sentNorm && !sentNorm.contains(n)
@@ -332,7 +381,6 @@ class RefineAccessibilityService : AccessibilityService() {
     }
 
     private fun collectClickables(node: AccessibilityNodeInfo, out: MutableList<AccessibilityNodeInfo>) {
-        // تجاهل نافذة لوحة المفاتيح بالكامل
         if (node.window?.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD) return
         if (node.isClickable) out.add(node)
         for (i in 0 until node.childCount) {
