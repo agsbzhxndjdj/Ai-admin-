@@ -22,12 +22,29 @@ class MainActivity : FlutterActivity() {
                         result.success(true)
                     }
 
+                    "listApps" -> {
+                        val pm = packageManager
+                        val list = pm.getInstalledApplications(0)
+                            .mapNotNull { app ->
+                                if (pm.getLaunchIntentForPackage(app.packageName) == null)
+                                    null
+                                else mapOf(
+                                    "package" to app.packageName,
+                                    "label" to app.loadLabel(pm).toString()
+                                )
+                            }
+                            .sortedBy { it["label"] }
+                        result.success(list)
+                    }
+
                     "startLoop" -> {
                         val task = call.argument<String>("task") ?: ""
                         val prompt = call.argument<String>("reviewPrompt") ?: ""
                         val rounds = call.argument<Int>("rounds") ?: 3
+                        val executor = call.argument<String>("executorPackage") ?: ""
+                        val reviewer = call.argument<String>("reviewerPackage") ?: ""
                         RefineAccessibilityService.instance
-                            ?.startLoop(task, prompt, rounds)
+                            ?.startLoop(task, prompt, rounds, executor, reviewer)
                         result.success(true)
                     }
 
